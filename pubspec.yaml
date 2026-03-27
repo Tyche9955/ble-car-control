@@ -1,0 +1,17 @@
+name: ble_car_control
+description: BLE\u5c0f\u8f66\u65e0\u7ebf\u906e\u63a7APP
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: 1.14.0
+  permission_handler: ^11.0.0
+  provider: ^6.1.2
+
+flutter:
+  uses-material-design: true
