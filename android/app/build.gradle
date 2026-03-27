@@ -4,17 +4,9 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
-def localProps = new Properties()
-def localPropertiesFile = new File(rootProject.projectDir, "local.properties")
-if (localPropertiesFile.exists()) {
-    localPropertiesFile.withReader("UTF-8") { reader ->
-        localProps.load(reader)
-    }
-}
-
 android {
     namespace "com.tyche9955.blecarcontrol"
-    compileSdk flutter.compileSdkVersion
+    compileSdk 34
     ndkVersion flutter.ndkVersion
 
     compileOptions {
@@ -33,8 +25,8 @@ android {
     defaultConfig {
         applicationId "com.tyche9955.blecarcontrol"
         minSdk 21
-        targetSdk flutter.targetSdkVersion
-        versionCode flutter.versionCode
+        targetSdk 34
+        versionCode 1
         versionName "1.0"
         multiDexEnabled true
     }
