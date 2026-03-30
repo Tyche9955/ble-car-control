@@ -1,90 +1,77 @@
 // ============================================================
-// car_manager.dart — 核心业务逻辑层
+// car_manager.dart — 核心业务逻辑（Xbox 协议版）
 //
-// 职责：
-//   - 管理 BLE 扫描、连接、断开
-//   - 自动发现 UART 特征值（Nordic UART / HM-10）
-//   - 封装所有指令发送（方向、速度、灯光、蜂鸣）
-//   - 维护通信日志
-//   - 继承 ChangeNotifier，状态变化时通知 UI 刷新
+// 数据包格式（6字节）：[0xFF, stickX, stickY, 按键Bitmap, LT, RT]
 //
-// 指令协议（2字节）：[命令码, 速度]
-//   0x00 = 停止    0x01 = 前进    0x02 = 后退
-//   0x03 = 左转    0x04 = 右转
-//   0x10 = 开灯    0x11 = 关灯    0x20 = 蜂鸣
+// 按键 Bitmap：
+//   0x01=A(前进)  0x02=B(后退)  0x04=X(左)  0x08=Y(右)
+//   0x10=LB(前灯) 0x20=RB(后灯) 0x40=Start(蜂鸣)
 // ============================================================
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
-/// 小车运动方向枚举
-enum Direction { stop, forward, backward, left, right }
+/// Xbox 按键枚举
+enum XboxButton { a, b, x, y, lb, rb, start, select }
 
-/// 车灯状态枚举
-enum LedState { off, on }
+/// 扳机枚举
+enum Trigger { lt, rt }
 
-/// CarManager — 小车状态管理器
-///
-/// 使用 Provider 模式，所有 UI 组件通过 context.watch<CarManager>()
-/// 订阅状态变化，无需手动 setState。
 class CarManager extends ChangeNotifier {
-  // ── 状态字段 ──────────────────────────────────────────────
+  bool isScanning = false;
+  bool isConnected = false;
+  BluetoothDevice? device;
+  BluetoothCharacteristic? txChar;
+  BluetoothCharacteristic? rxChar;
+  List<ScanResult> devices = [];
+  List<String> logs = [];
 
-  bool isScanning = false;      // 是否正在扫描
-  bool isConnected = false;     // 是否已连接设备
-  BluetoothDevice? device;      // 当前连接的蓝牙设备
-  BluetoothCharacteristic? txChar; // 发送特征值（手机 → 小车）
-  BluetoothCharacteristic? rxChar; // 接收特征值（小车 → 手机）
-  List<ScanResult> devices = [];   // 扫描到的设备列表
-  Direction direction = Direction.stop; // 当前运动方向
-  int speed = 50;               // 当前速度（0–100）
-  LedState led = LedState.off;  // 当前灯光状态
-  List<String> logs = [];       // 通信日志（最多保留100条）
+  /// 摇杆 X 轴：-100~100（负=左，正=右）
+  int stickX = 0;
 
-  // ── 日志 ──────────────────────────────────────────────────
+  /// 摇杆 Y 轴：-100~100（负=上，正=下）
+  int stickY = 0;
 
-  /// 添加一条带时间戳的日志，插入到列表头部（最新在上）
+  /// 按键 Bitmap
+  int buttonBitmap = 0;
+
+  /// LT（左扳机）
+  int lt = 0;
+
+  /// RT（右扳机）
+  int rt = 0;
+
+  /// 前灯状态
+  bool frontLight = false;
+
+  /// 后灯状态
+  bool rearLight = false;
+
+  // ── 日志 ────────────────────────────────────────────────
   void addLog(String msg) {
-    final time = DateTime.now().toString().substring(11, 19); // HH:mm:ss
-    logs.insert(0, '[$time] $msg');
-    if (logs.length > 100) logs.removeLast(); // 超过100条时删除最旧的
+    final t = DateTime.now().toString().substring(11, 19);
+    logs.insert(0, '[\] ');
+    if (logs.length > 100) logs.removeLast();
     notifyListeners();
   }
 
-  // ── 扫描 ──────────────────────────────────────────────────
-
-  /// 开始 BLE 扫描，持续 10 秒
-  ///
-  /// 扫描结果实时更新到 [devices] 列表，UI 会自动刷新。
+  // ── 扫描 ────────────────────────────────────────────────
   Future<void> startScan() async {
     devices.clear();
     isScanning = true;
     notifyListeners();
     addLog('开始扫描...');
-
     try {
-      // 启动扫描，设置超时时间
       await FlutterBluePlus.startScan(timeout: Duration(seconds: 10));
-
-      // 监听扫描结果流，每次有新设备都更新列表
-      FlutterBluePlus.scanResults.listen((results) {
-        devices = results;
-        notifyListeners();
-      });
-
-      // 等待扫描完成
+      FlutterBluePlus.scanResults.listen((r) { devices = r; notifyListeners(); });
       await Future.delayed(Duration(seconds: 10));
-    } catch (e) {
-      addLog('扫描失败');
-    }
-
+    } catch (e) { addLog('扫描失败'); }
     isScanning = false;
-    addLog('扫描完成，发现 \${devices.length} 台设备');
+    addLog('扫描完成，发现 \ 台设备');
     notifyListeners();
   }
 
-  /// 手动停止扫描
   void stopScan() {
     try { FlutterBluePlus.stopScan(); } catch (_) {}
     isScanning = false;
@@ -92,194 +79,191 @@ class CarManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ── 连接 ──────────────────────────────────────────────────
-
-  /// 连接指定蓝牙设备
-  ///
-  /// 连接成功后自动调用 [_discoverServices] 发现 UART 特征值。
-  /// 同时监听连接状态，断开时自动重置所有状态。
-  ///
-  /// 返回 true 表示连接成功，false 表示失败。
+  // ── 连接 ────────────────────────────────────────────────
   Future<bool> connect(BluetoothDevice d) async {
     try {
       addLog('连接中...');
       await d.connect(timeout: Duration(seconds: 15));
-
       device = d;
       isConnected = true;
       addLog('连接成功！');
-
-      // 连接成功后异步发现服务（不阻塞 UI）
       _discoverServices(d);
-
-      // 监听连接状态变化，设备断开时自动清理状态
       d.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
-          isConnected = false;
-          txChar = null;
-          rxChar = null;
-          direction = Direction.stop;
-          led = LedState.off;
-          addLog('连接已断开');
-          notifyListeners();
+          isConnected = false; txChar = null; rxChar = null;
+          _resetAll(); addLog('连接已断开'); notifyListeners();
         }
       });
-
       notifyListeners();
       return true;
-    } catch (e) {
-      addLog('连接失败');
-      notifyListeners();
-      return false;
-    }
+    } catch (e) { addLog('连接失败'); notifyListeners(); return false; }
   }
 
-  /// 发现 GATT 服务，自动识别 UART 特征值
-  ///
-  /// 支持两种常见协议：
-  ///   - Nordic UART：TX=6E400002, RX=6E400003
-  ///   - HM-10/HC-08：TX=FFE1, RX=FFE2
-  ///
-  /// 找到 RX 特征后自动开启 Notify，接收小车回传数据。
   Future<void> _discoverServices(BluetoothDevice d) async {
     try {
-      final services = await d.discoverServices();
-
-      for (final service in services) {
-        for (final characteristic in service.characteristics) {
-          final uuid = characteristic.uuid.toString().toLowerCase();
-
-          // 识别发送特征（手机 → 小车）
-          if (uuid.contains('6e400002') || uuid.contains('ffe1')) {
-            txChar = characteristic;
-            addLog('TX特征: \${characteristic.uuid}');
+      final svcs = await d.discoverServices();
+      for (final svc in svcs) {
+        for (final c in svc.characteristics) {
+          final u = c.uuid.toString().toLowerCase();
+          if (u.contains('6e400002') || u.contains('ffe1')) {
+            txChar = c; addLog('TX: ');
           }
-
-          // 识别接收特征（小车 → 手机），并开启通知
-          if (uuid.contains('6e400003') || uuid.contains('ffe2')) {
-            rxChar = characteristic;
-            await characteristic.setNotifyValue(true); // 开启 Notify
-
-            // 监听小车回传数据，转为 HEX 字符串显示在日志
-            characteristic.onValueReceived.listen((data) {
-              final hex = data
-                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
-                  .join(' ');
-              addLog('RX: \$hex');
+          if (u.contains('6e400003') || u.contains('ffe2')) {
+            rxChar = c;
+            await c.setNotifyValue(true);
+            c.onValueReceived.listen((data) {
+              final hex = data.map((b) => b.toRadixString(16).padLeft(2,'0')).join(' ');
+              addLog('RX: ');
             });
-
-            addLog('RX特征: \${characteristic.uuid}');
+            addLog('RX: ');
           }
         }
       }
-
       if (txChar == null) addLog('未找到UART特征，自动模式');
       notifyListeners();
-    } catch (e) {
-      addLog('服务发现失败');
-    }
+    } catch (e) { addLog('服务发现失败'); }
   }
 
-  /// 主动断开连接，重置所有状态
   Future<void> disconnect() async {
-    if (device != null) {
-      try { await device!.disconnect(); } catch (_) {}
-    }
-    isConnected = false;
-    txChar = null;
-    rxChar = null;
-    direction = Direction.stop;
-    led = LedState.off;
-    addLog('已断开');
-    notifyListeners();
+    if (device != null) { try { await device!.disconnect(); } catch (_) {} }
+    isConnected = false; txChar = null; rxChar = null;
+    _resetAll(); addLog('已断开'); notifyListeners();
   }
 
-  // ── 指令发送 ──────────────────────────────────────────────
+  void _resetAll() {
+    stickX = 0; stickY = 0; buttonBitmap = 0;
+    lt = 0; rt = 0; frontLight = false; rearLight = false;
+  }
 
-  /// 发送原始字节数组到小车
-  ///
-  /// 通过 [txChar] 写入数据，同时记录到日志。
-  Future<void> sendCommand(List<int> data) async {
-    if (txChar == null) {
-      addLog('未配置发送特征');
-      return;
-    }
+  // ── Xbox 指令发送 ───────────────────────────────────────
+
+  /// 发送 Xbox 数据包（6字节）
+  /// 格式：[0xFF, stickX_offset, stickY_offset, buttons, lt, rt]
+  /// stickX/Y 范围 -100~100，发送时 +100 转为 0~200
+  Future<void> _sendPacket() async {
+    if (txChar == null) return;
+    final data = [
+      0xFF,
+      (stickX + 100).clamp(0, 200),
+      (stickY + 100).clamp(0, 200),
+      buttonBitmap,
+      lt.clamp(0, 100),
+      rt.clamp(0, 100),
+    ];
     try {
       await txChar!.write(data);
-      // 将发送的字节转为大写 HEX 字符串记录日志
-      final hex = data
-          .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
-          .join(' ');
-      addLog('TX: \$hex');
-    } catch (e) {
-      addLog('发送失败');
-    }
+      final hex = data.map((b) => b.toRadixString(16).padLeft(2,'0').toUpperCase()).join(' ');
+      addLog('TX: ');
+    } catch (e) { addLog('发送失败'); }
   }
 
-  /// 发送方向指令
-  ///
-  /// 格式：[命令码, 速度]，例如前进50%速度 = [0x01, 50]
-  Future<void> sendDirection(Direction dir) async {
-    direction = dir;
-    notifyListeners();
-
-    // 将枚举映射为命令码
-    int cmd;
-    switch (dir) {
-      case Direction.forward:  cmd = 0x01; break;
-      case Direction.backward: cmd = 0x02; break;
-      case Direction.left:     cmd = 0x03; break;
-      case Direction.right:    cmd = 0x04; break;
-      default:                 cmd = 0x00; // stop
-    }
-
-    await sendCommand([cmd, speed]);
+  /// 更新摇杆
+  void updateStick({int? x, int? y}) {
+    if (x != null) stickX = x.clamp(-100, 100);
+    if (y != null) stickY = y.clamp(-100, 100);
+    _sendPacket(); notifyListeners();
   }
 
-  /// 停止小车（发送停止指令）
-  void stop() => sendDirection(Direction.stop);
+  /// 停止摇杆
+  void resetStick() { stickX = 0; stickY = 0; _sendPacket(); notifyListeners(); }
 
-  /// 设置速度并立即生效（如果正在运动中）
-  ///
-  /// [s] 范围 0–100，超出范围自动截断。
-  void setSpeed(int s) {
-    speed = s.clamp(0, 100);
-    notifyListeners();
-    // 如果当前正在运动，立即用新速度重发方向指令
-    if (direction != Direction.stop && isConnected) {
-      sendDirection(direction);
-    }
-  }
-
-  /// 切换灯光状态（开 ↔ 关）
-  void toggleLed() {
-    if (led == LedState.off) {
-      led = LedState.on;
-      sendCommand([0x10]); // 开灯指令
+  /// 方向键辅助：dx=-1左/0中/1右，dy=-1上/0中/1下
+  void setDirection(int dx, int dy) {
+    if (dx == 0 && dy == 0) {
+      stickX = 0; stickY = 0;
     } else {
-      led = LedState.off;
-      sendCommand([0x11]); // 关灯指令
+      stickX = dx * 80; // 80% 幅度
+      stickY = dy * 80;
     }
-    notifyListeners();
+    _sendPacket(); notifyListeners();
   }
 
-  /// 触发蜂鸣器
-  void sendBuzzer() => sendCommand([0x20]);
+  /// 按键按下
+  void buttonPress(XboxButton btn) {
+    buttonBitmap |= _bit(btn);
+    switch (btn) {
+      case XboxButton.a: setDirection(0, -1); break; // 上
+      case XboxButton.b: setDirection(0, 1);  break; // 下
+      case XboxButton.x: setDirection(-1, 0);  break; // 左
+      case XboxButton.y: setDirection(1, 0);   break; // 右
+      case XboxButton.lb:
+        frontLight = !frontLight;
+        addLog(frontLight ? '前灯开启' : '前灯关闭'); break;
+      case XboxButton.rb:
+        rearLight = !rearLight;
+        addLog(rearLight ? '后灯开启' : '后灯关闭'); break;
+      case XboxButton.start:
+        addLog('蜂鸣器触发'); break;
+    }
+    _sendPacket(); notifyListeners();
+  }
 
-  /// 发送自定义 HEX 指令
-  ///
-  /// [hexInput] 格式：空格分隔的十六进制字符串，如 "01 64" 或 "0164"
+  /// 按键释放
+  void buttonRelease(XboxButton btn) {
+    buttonBitmap &= ~_bit(btn);
+    if (btn == XboxButton.a || btn == XboxButton.b ||
+        btn == XboxButton.x || btn == XboxButton.y) {
+      // 检查是否还有方向键按住
+      int remaining = buttonBitmap & 0x0F;
+      if (remaining == 0) { stickX = 0; stickY = 0; }
+      else {
+        if (remaining & 0x01 != 0) setDirection(0, -1);
+        else if (remaining & 0x02 != 0) setDirection(0, 1);
+        else if (remaining & 0x04 != 0) setDirection(-1, 0);
+        else if (remaining & 0x08 != 0) setDirection(1, 0);
+        return;
+      }
+    }
+    _sendPacket(); notifyListeners();
+  }
+
+  /// 扳机变化
+  void updateTrigger(Trigger t, int value) {
+    value = value.clamp(0, 100);
+    if (t == Trigger.lt) {
+      lt = value;
+      if (value >= 50 && !frontLight) { frontLight = true; addLog('前灯开启'); }
+      else if (value < 50 && frontLight) { frontLight = false; addLog('前灯关闭'); }
+    } else {
+      rt = value;
+      if (value >= 50 && !rearLight) { rearLight = true; addLog('后灯开启'); }
+      else if (value < 50 && rearLight) { rearLight = false; addLog('后灯关闭'); }
+    }
+    _sendPacket(); notifyListeners();
+  }
+
+  /// 紧急停止
+  void emergencyStop() {
+    stickX = 0; stickY = 0; buttonBitmap = 0;
+    lt = 0; rt = 0; frontLight = false; rearLight = false;
+    _sendPacket(); addLog('## 紧急停止 ##'); notifyListeners();
+  }
+
+  /// 自定义 HEX 指令
   void sendCustom(String hexInput) {
     try {
-      final hex = hexInput.replaceAll(' ', ''); // 去掉空格
+      final hex = hexInput.replaceAll(' ', '');
       final data = <int>[];
-      // 每两个字符解析为一个字节
-      for (int i = 0; i + 2 <= hex.length; i += 2) {
+      for (int i = 0; i + 2 <= hex.length; i += 2)
         data.add(int.parse(hex.substring(i, i + 2), radix: 16));
+      if (txChar != null) {
+        txChar!.write(data);
+        final logHex = data.map((b) => b.toRadixString(16).padLeft(2,'0').toUpperCase()).join(' ');
+        addLog('TX: ');
       }
-      sendCommand(data);
-    } catch (_) {
-      addLog('HEX格式错误');
+    } catch (_) { addLog('HEX格式错误'); }
+  }
+
+  int _bit(XboxButton btn) {
+    switch (btn) {
+      case XboxButton.a:      return 0x01;
+      case XboxButton.b:       return 0x02;
+      case XboxButton.x:       return 0x04;
+      case XboxButton.y:       return 0x08;
+      case XboxButton.lb:      return 0x10;
+      case XboxButton.rb:      return 0x20;
+      case XboxButton.start:   return 0x40;
+      case XboxButton.select:  return 0x80;
     }
   }
 }
