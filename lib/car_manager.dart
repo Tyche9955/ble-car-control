@@ -194,6 +194,8 @@ class CarManager extends ChangeNotifier {
         addLog(rearLight ? '后灯开启' : '后灯关闭'); break;
       case XboxButton.start:
         addLog('蜂鸣器触发'); break;
+      case XboxButton.select:
+        addLog('Select键'); break;
     }
     _sendPacket(); notifyListeners();
   }
